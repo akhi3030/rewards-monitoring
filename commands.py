@@ -40,7 +40,7 @@ def run_command(cmd):
 
 def write_log(message):
     """Append message to log file."""
-    with open(OUTPUT_FILE, "w") as f:
+    with open(OUTPUT_FILE, "a") as f:
         f.write(message)
         f.write("\n")
 
