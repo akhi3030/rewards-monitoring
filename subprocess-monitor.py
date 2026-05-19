@@ -4,6 +4,8 @@ import re
 import json
 import subprocess
 
+LAMPORTS_PER_SOL = 1_000_000_000
+
 
 def get_solana_stakes_output() -> str:
     """
@@ -19,6 +21,19 @@ def get_solana_stakes_output() -> str:
     return result.stdout
 
 
+def sol_to_lamports(value: str):
+    """
+    Convert a CLI-formatted SOL amount like `1.234 SOL` into integer lamports.
+    Returns None if the value is not a SOL-denominated numeric amount.
+    """
+    m = re.match(r"^([0-9]+(?:\.[0-9]+)?)\s+SOL$", value)
+    if not m:
+        return None
+
+    sol_amount = float(m.group(1))
+    return int(round(sol_amount * LAMPORTS_PER_SOL))
+
+
 def parse_solana_stakes(output: str) -> dict:
     """
     Parse `solana stakes` CLI output into a structured dictionary.
@@ -26,8 +41,8 @@ def parse_solana_stakes(output: str) -> dict:
     Returns:
     {
         "<stake_account_pubkey>": {
-            "balance": "1.234 SOL",
-            "delegated_stake": "1.233 SOL",
+            "balance": 1234000000,
+            "delegated_stake": 1233000000,
             "delegated_vote_account_address": "...",
             "activation_epoch": "123",
             ...
@@ -71,8 +86,11 @@ def parse_solana_stakes(output: str) -> dict:
             )
 
             value = m.group(2).strip()
+            lamports_value = sol_to_lamports(value)
 
-            stakes[current_account][key] = value
+            stakes[current_account][key] = (
+                lamports_value if lamports_value is not None else value
+            )
 
     return stakes
 
