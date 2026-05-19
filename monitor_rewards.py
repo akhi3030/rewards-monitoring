@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import sys
 import time
@@ -9,7 +8,7 @@ from solana.rpc.api import Client
 from solders.pubkey import Pubkey
 
 
-RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
+RPC_URL = "http://127.0.0.1:8899"
 POLL_INTERVAL_SECONDS = int(os.getenv("POLL_INTERVAL_SECONDS", "30"))
 
 
@@ -199,6 +198,13 @@ def main() -> None:
     print(f"Polling every {POLL_INTERVAL_SECONDS} seconds...")
 
     last_seen_epoch = current_epoch
+
+
+    authority_rewards = get_epoch_rewards_grouped_by_authority(client, current_epoch)
+    print_epoch_rewards(current_epoch, authority_rewards)
+ 
+
+    
 
     while True:
         try:
