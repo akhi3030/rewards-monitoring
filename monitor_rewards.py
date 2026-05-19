@@ -1,8 +1,9 @@
+import base64
 import os
 import sys
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from solana.rpc.api import Client
 from solders.pubkey import Pubkey
@@ -52,16 +53,60 @@ def chunked(items: List[str], size: int) -> List[List[str]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
+def decode_authorized_pubkeys_from_stake_account(data: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Decode enough of the stake-account binary layout to extract the
+    authorized staker and withdrawer pubkeys.
+    """
+    if len(data) < 76:
+        return None, None
+
+    state = int.from_bytes(data[0:4], "little")
+    if state not in (1, 2):
+        return None, None
+
+    try:
+        staker = str(Pubkey.from_bytes(data[12:44]))
+        withdrawer = str(Pubkey.from_bytes(data[44:76]))
+        return staker, withdrawer
+    except Exception:
+        return None, None
+
+
 def fetch_all_stake_accounts(client: Client) -> List[dict]:
     """
-    Fetch all stake-program accounts using getProgramAccounts.
+    Fetch all stake-program accounts using getProgramAccounts with raw base64 data.
     """
     stake_program = Pubkey.from_string("Stake11111111111111111111111111111111111111")
     resp = client.get_program_accounts(
         stake_program,
-        encoding="jsonParsed",
+        encoding="base64",
     )
-    return [acct.account.data.parsed for acct in resp.value]
+
+    parsed_accounts = []
+    for acct in resp.value:
+        try:
+            encoded, encoding = acct.account.data
+            if encoding != "base64":
+                continue
+
+            decoded = base64.b64decode(encoded)
+            staker, withdrawer = decode_authorized_pubkeys_from_stake_account(decoded)
+            parsed_accounts.append(
+                {
+                    "stakeAccount": str(acct.pubkey),
+                    "meta": {
+                        "authorized": {
+                            "staker": staker,
+                            "withdrawer": withdrawer,
+                        }
+                    },
+                }
+            )
+        except Exception:
+            continue
+
+    return parsed_accounts
 
 
 def extract_staker_and_withdrawer(parsed_accounts: List[dict]) -> Dict[str, List[str]]:
@@ -73,12 +118,11 @@ def extract_staker_and_withdrawer(parsed_accounts: List[dict]) -> Dict[str, List
 
     for parsed in parsed_accounts:
         try:
-            info = parsed["info"]
-            meta = info.get("meta", {})
+            meta = parsed.get("meta", {})
             authorized = meta.get("authorized", {})
             staker = authorized.get("staker")
             withdrawer = authorized.get("withdrawer")
-            stake_pubkey = info.get("stakeAccount")
+            stake_pubkey = parsed.get("stakeAccount")
         except Exception:
             continue
 
@@ -97,16 +141,21 @@ def fetch_all_stake_accounts_with_addresses(client: Client) -> List[dict]:
     stake_program = Pubkey.from_string("Stake11111111111111111111111111111111111111")
     resp = client.get_program_accounts(
         stake_program,
-        encoding="jsonParsed",
+        encoding="base64",
     )
 
     result = []
     for acct in resp.value:
         try:
+            encoded= acct.account.data
+            decoded = base64.b64decode(encoded)
+            staker, withdrawer = decode_authorized_pubkeys_from_stake_account(decoded)
+
             result.append(
                 {
                     "pubkey": str(acct.pubkey),
-                    "parsed": acct.account.data.parsed,
+                    "staker": staker,
+                    "withdrawer": withdrawer,
                 }
             )
         except Exception:
@@ -117,19 +166,12 @@ def fetch_all_stake_accounts_with_addresses(client: Client) -> List[dict]:
 def build_authority_to_stake_accounts(client: Client) -> Dict[str, List[str]]:
     authority_map: Dict[str, List[str]] = defaultdict(list)
     accounts = fetch_all_stake_accounts_with_addresses(client)
+    print(accounts)
 
     for entry in accounts:
         pubkey = entry["pubkey"]
-        parsed = entry["parsed"]
-
-        try:
-            info = parsed["info"]
-            meta = info.get("meta", {})
-            authorized = meta.get("authorized", {})
-            staker = authorized.get("staker")
-            withdrawer = authorized.get("withdrawer")
-        except Exception:
-            continue
+        staker = entry.get("staker")
+        withdrawer = entry.get("withdrawer")
 
         if staker:
             authority_map[staker].append(pubkey)
@@ -184,6 +226,65 @@ def print_epoch_rewards(epoch: int, authority_rewards: Dict[str, int]) -> None:
     print("=====================================")
 
 
+def parse_solana_stakes(output: str) -> dict:
+    """
+    Parse `solana stakes` CLI output into a structured dictionary.
+
+    Returns:
+    {
+        "<stake_account_pubkey>": {
+            "balance": "1.234 SOL",
+            "delegated_stake": "1.233 SOL",
+            "delegated_vote_account_address": "...",
+            "activation_epoch": "123",
+            "deactivation_epoch": "None",
+            ...
+        },
+        ...
+    }
+    """
+
+    stakes = {}
+    current_account = None
+
+    # Match lines like:
+    # Stake Pubkey: XXXXX
+    stake_pubkey_re = re.compile(r"^Stake Pubkey:\s+(.+)$")
+
+    # Match generic key/value lines:
+    # Balance: 1.23 SOL
+    kv_re = re.compile(r"^\s*([^:]+):\s+(.+)$")
+
+    for line in output.splitlines():
+        line = line.rstrip()
+
+        # Detect new stake account
+        m = stake_pubkey_re.match(line)
+        if m:
+            current_account = m.group(1).strip()
+            stakes[current_account] = {}
+            continue
+
+        if current_account is None:
+            continue
+
+        # Parse generic fields
+        m = kv_re.match(line)
+        if m:
+            key = (
+                m.group(1)
+                .strip()
+                .lower()
+                .replace(" ", "_")
+            )
+
+            value = m.group(2).strip()
+
+            stakes[current_account][key] = value
+
+    return stakes
+
+
 def main() -> None:
     client = get_client()
 
@@ -193,18 +294,17 @@ def main() -> None:
         print(f"Failed to fetch current epoch: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    authority_rewards = get_epoch_rewards_grouped_by_authority(client, current_epoch)
+    print_epoch_rewards(current_epoch, authority_rewards)
+    print("********** returning early")
+    return
+
     print(f"Connected to {RPC_URL}")
     print(f"Starting at current epoch: {current_epoch}")
     print(f"Polling every {POLL_INTERVAL_SECONDS} seconds...")
 
     last_seen_epoch = current_epoch
 
-
-    authority_rewards = get_epoch_rewards_grouped_by_authority(client, current_epoch)
-    print_epoch_rewards(current_epoch, authority_rewards)
- 
-
-    
 
     while True:
         try:
